@@ -74,12 +74,21 @@ Kiểm tra:
 nproc
 free -h
 df -h
-sudo ss -lntp | grep -E ':80 |:443 '
+sudo ss -lntp | grep -E ':80 |:443 |:8080 |:8081 |:8443 '
 ```
 
-Harbor mặc định sử dụng port `80` và `443`. Jenkins hiện dùng port `8080` nên chưa xung đột.
+Trong hướng dẫn này sử dụng sơ đồ port sau:
 
-Nếu sau này Jenkins cũng cần chạy tại `https://jenkins.example.com:443`, cần đặt một reverse proxy chung phía trước hoặc cấp thêm IP cho Server 1. Không thể để Harbor Nginx và một Nginx khác cùng bind port `443` trên một IP.
+| Dịch vụ | Port trên Server 1 | Cách truy cập |
+|---|---:|---|
+| Jenkins | `8080` | Nội bộ hoặc qua hostname riêng |
+| Harbor HTTP origin | `8081` | Chỉ dùng khi cần kiểm tra/chuyển hướng nội bộ |
+| Harbor HTTPS origin | `8443` | Cloudflare Tunnel kết nối tới port này |
+| Harbor public | `443` tại Cloudflare edge | `https://harbor.example.com` |
+
+`cloudflared` tạo kết nối outbound tới Cloudflare nên bản thân tiến trình này thường không bind port `80` hoặc `443` trên Server 1. Nếu hai port đó đang bận, lệnh `ss` ở trên sẽ cho biết tiến trình thực tế đang sử dụng chúng. Dù vậy, dùng `8081/8443` cho Harbor vẫn giúp tách origin khỏi các reverse proxy và dịch vụ khác trên máy.
+
+Không mở public inbound `8081` và `8443` trong cloud firewall/security group. Khi `cloudflared` chạy ngay trên Server 1, Tunnel truy cập origin qua loopback. Chỉ cho phép subnet private của Jenkins agent hoặc node K3s truy cập `8443` nếu chủ động cho các máy đó kết nối trực tiếp thay vì đi qua Tunnel.
 
 Tham khảo: [Harbor installation prerequisites](https://goharbor.io/docs/edge/install-config/installation-prereqs/)
 
@@ -163,7 +172,7 @@ openssl x509 \
   -ext subjectAltName
 ```
 
-Nếu dùng CA nội bộ, phải cài CA root lên build agent, Server 2 và Server 3. Không sử dụng `--insecure` trong pipeline.
+Nếu mọi client truy cập Harbor qua Cloudflare Tunnel, chỉ dịch vụ `cloudflared` trên Server 1 cần tin cậy CA của origin. Chỉ cài CA root lên build agent, Server 2 và Server 3 khi các máy này kết nối trực tiếp tới origin. Không sử dụng `--insecure` trong pipeline.
 
 Tham khảo: [Configure HTTPS access to Harbor](https://goharbor.io/docs/main/install-config/configure-https/)
 
@@ -203,12 +212,16 @@ sudo nano harbor.yml
 hostname: harbor.example.com
 
 http:
-  port: 80
+  port: 8081
 
 https:
-  port: 443
+  port: 8443
   certificate: /etc/harbor/tls/harbor.crt
   private_key: /etc/harbor/tls/harbor.key
+
+# URL public mà Docker, Jenkins và trình duyệt sử dụng qua Cloudflare Tunnel.
+# Khi đặt external_url, Harbor dùng giá trị này để tạo URL và token service.
+external_url: https://harbor.example.com
 
 # Dùng mật khẩu dài, ngẫu nhiên và không commit file này lên Git.
 harbor_admin_password: CHANGE_TO_A_LONG_RANDOM_PASSWORD
@@ -223,6 +236,8 @@ trivy:
   skip_update: false
   offline_scan: false
 ```
+
+Chứng chỉ origin tại `/etc/harbor/tls/harbor.crt` phải có SAN `harbor.example.com`. Giữ `external_url` không có `:8443`: client truy cập Cloudflare bằng HTTPS port `443`, còn Cloudflare mới kết nối tới origin port `8443`.
 
 Tạo data directory trên ổ đĩa có đủ dung lượng:
 
@@ -243,16 +258,82 @@ Kiểm tra:
 cd /opt/harbor
 sudo docker compose ps
 sudo docker compose logs --tail=100
+
+# Kiểm tra trực tiếp origin, không đi qua Cloudflare.
+curl --resolve harbor.example.com:8443:127.0.0.1 \
+  -fsS https://harbor.example.com:8443/api/v2.0/ping
+```
+
+Nếu origin dùng CA nội bộ chưa có trong trust store của Server 1, thêm `--cacert /duong-dan/ca-root.crt` vào lệnh kiểm tra; không dùng `-k`.
+
+Nếu Harbor đã được cài bằng port cũ, sau khi sửa `harbor.yml` hãy tạo lại cấu hình và container, không xóa data volume:
+
+```bash
+cd /opt/harbor
+sudo ./prepare --with-trivy
+sudo docker compose down
+sudo docker compose up -d
+sudo docker compose ps
+```
+
+### 8.1. Trỏ Cloudflare Tunnel vào Harbor port `8443`
+
+Nếu Tunnel được quản lý trong Cloudflare Dashboard, tạo Public Hostname với các giá trị:
+
+| Trường | Giá trị |
+|---|---|
+| Subdomain/hostname | `harbor.example.com` |
+| Service type | `HTTPS` |
+| URL | `localhost:8443` |
+| Origin Server Name | `harbor.example.com` |
+| No TLS Verify | Tắt |
+
+Nếu dùng Tunnel được quản lý bằng file local, cập nhật `/etc/cloudflared/config.yml`:
+
+```yaml
+tunnel: TUNNEL_UUID
+credentials-file: /root/.cloudflared/TUNNEL_UUID.json
+
+ingress:
+  - hostname: harbor.example.com
+    service: https://127.0.0.1:8443
+    originRequest:
+      originServerName: harbor.example.com
+      # Bỏ comment nếu chứng chỉ Harbor do CA nội bộ ký.
+      # caPool: /etc/cloudflared/harbor-ca.crt
+
+  - service: http_status:404
+```
+
+Không bật `noTLSVerify: true` lâu dài. Nếu dùng CA nội bộ, chép CA root tới Server 1, đặt quyền đọc cho dịch vụ `cloudflared`, rồi khai báo `caPool` như ví dụ.
+
+Kiểm tra và restart Tunnel:
+
+```bash
+sudo cloudflared tunnel ingress validate
+sudo cloudflared tunnel ingress rule https://harbor.example.com
+sudo systemctl restart cloudflared
+sudo systemctl status cloudflared --no-pager
+
+# Kiểm tra qua Cloudflare Tunnel.
 curl -fsS https://harbor.example.com/api/v2.0/ping
 ```
 
-Đăng nhập trình duyệt:
+Trình duyệt truy cập URL public, không thêm port origin:
 
 ```text
 https://harbor.example.com
 ```
 
-Tham khảo: [Run the Harbor installer](https://goharbor.io/docs/edge/install-config/run-installer-script/)
+Docker cũng sử dụng hostname public:
+
+```bash
+docker login harbor.example.com
+```
+
+> **Lưu ý khi push image qua Cloudflare:** lưu lượng Registry đi qua HTTP proxy của Cloudflare chịu giới hạn kích thước request theo gói (ví dụ Free/Pro là 100 MB và Business là 200 MB tại thời điểm viết tài liệu) và có thể gặp timeout với layer lớn. Nếu Jenkins báo `413` hoặc `524`, ưu tiên cho build agent và các node K3s truy cập Harbor qua mạng private/VPN hoặc Cloudflare private network; không mở `8443` ra toàn Internet và không chuyển Docker sang `insecure-registry`.
+
+Tham khảo: [Run the Harbor installer](https://goharbor.io/docs/edge/install-config/run-installer-script/), [Harbor `external_url`](https://goharbor.io/docs/edge/install-config/configure-yml-file/), [Cloudflare Tunnel HTTPS origin](https://developers.cloudflare.com/tunnel/troubleshooting/https-origins/), [Cloudflare Tunnel configuration file](https://developers.cloudflare.com/tunnel/features/locally-managed-tunnels/configuration-file/), [Cloudflare upload limits](https://developers.cloudflare.com/support/troubleshooting/http-status-codes/4xx-client-error/error-413/)
 
 ## 9. Tạo project và policy trong Harbor
 
@@ -437,9 +518,9 @@ kustomize version
 
 ## 18. Cho build agent tin cậy Harbor TLS
 
-Nếu Harbor dùng public CA, thường không cần bước này.
+Nếu build agent truy cập `https://harbor.example.com` qua Cloudflare Tunnel, agent nhận chứng chỉ public ở Cloudflare edge nên thường không cần cài CA của origin. CA origin chỉ cần được `cloudflared` trên Server 1 tin cậy.
 
-Nếu Harbor dùng CA nội bộ, chép CA root lên agent rồi chạy:
+Chỉ thực hiện phần dưới đây nếu build agent kết nối trực tiếp tới Harbor origin bằng hostname private và port `8443`. Chép CA root lên agent rồi chạy:
 
 ```bash
 sudo install -m 0644 harbor-ca.crt \
@@ -448,14 +529,16 @@ sudo install -m 0644 harbor-ca.crt \
 sudo update-ca-certificates
 
 sudo install -d -m 0755 \
-  /etc/docker/certs.d/harbor.example.com
+  /etc/docker/certs.d/harbor.internal.example.com:8443
 
 sudo install -m 0644 harbor-ca.crt \
-  /etc/docker/certs.d/harbor.example.com/ca.crt
+  /etc/docker/certs.d/harbor.internal.example.com:8443/ca.crt
 
 sudo systemctl restart docker
-curl -fsS https://harbor.example.com/api/v2.0/ping
+curl -fsS https://harbor.internal.example.com:8443/api/v2.0/ping
 ```
+
+Khi dùng endpoint private, chứng chỉ phải có SAN `harbor.internal.example.com`; đồng thời biến `HARBOR_HOST` của pipeline phải là `harbor.internal.example.com:8443`. Nếu dùng endpoint public qua Tunnel như pipeline mẫu trong tài liệu, tiếp tục giữ `HARBOR_HOST=harbor.example.com`.
 
 ## 19. Tạo SSH key cho controller kết nối agent
 
