@@ -6,7 +6,7 @@
 ## 1. Kiến trúc sau khi hoàn thành
 
 ```text
-Người vận hành chọn branch develop/main trong Jenkins
+Người vận hành chọn branch staging/main trong Jenkins
                          │
                          ▼
                 Jenkins Controller
@@ -39,7 +39,7 @@ Quy ước branch:
 
 | Source branch | Môi trường | GitOps overlay | Cơ chế |
 |---|---|---|---|
-| `develop` | Staging | `overlays/staging` | Tự động cập nhật GitOps |
+| `staging` | Staging | `overlays/staging` | Tự động cập nhật GitOps |
 | `main` | Production | `overlays/production` | Yêu cầu phê duyệt trong Jenkins |
 
 Pipeline không đưa kubeconfig vào Jenkins và không chạy `kubectl apply`. Jenkins chỉ cập nhật GitOps repository; Argo CD chịu trách nhiệm triển khai.
@@ -766,8 +766,8 @@ pipeline {
     parameters {
         choice(
             name: 'BRANCH_NAME',
-            choices: ['develop', 'main'],
-            description: 'develop triển khai staging; main triển khai production sau khi approve'
+            choices: ['staging', 'main'],
+            description: 'staging triển khai staging; main triển khai production sau khi approve'
         )
     }
 
@@ -1079,7 +1079,7 @@ pipeline {
 1. Thay URL GitHub, domain Harbor, project và image name trước khi chạy.
 2. `make ci-lint` và `make ci-test` phải hoạt động trên agent.
 3. Scan trả exit code `1` khi có `HIGH/CRITICAL`, do đó build sẽ dừng trước khi push.
-4. Tag có dạng `branch-commit-build`, ví dụ `develop-a83c21f093bd-42`; không dùng `latest`.
+4. Tag có dạng `branch-commit-build`, ví dụ `staging-a83c21f093bd-42`; không dùng `latest`.
 5. GitOps lưu image theo digest, không theo mutable tag.
 6. Với production nghiêm ngặt, nên để pipeline tạo branch/PR cho GitOps production thay vì push trực tiếp vào `main`. Ví dụ trên dùng Jenkins approval để giữ quy trình dễ triển khai ban đầu.
 7. Sau khi pipeline ký thành công, có thể bật Cosign content trust trong Harbor project.
@@ -1119,15 +1119,15 @@ Lưu job rồi chạy `Build Now` lần đầu để Jenkins đọc phần `para
 ```text
 Build with Parameters
 └── BRANCH_NAME
-    ├── develop
+    ├── staging
     └── main
 ```
 
 ## 31. Kiểm tra pipeline lần đầu
 
-Chạy `develop` trước và kiểm tra theo thứ tự:
+Chạy `staging` trước và kiểm tra theo thứ tự:
 
-1. Jenkins checkout đúng commit HEAD của `develop`.
+1. Jenkins checkout đúng commit HEAD của `staging`.
 2. Lint và test thành công.
 3. Trivy không phát hiện lỗi vượt ngưỡng.
 4. Harbor xuất hiện image tag mới.
