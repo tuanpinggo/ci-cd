@@ -2,12 +2,19 @@ apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: fresh-portal
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: true
   labels:
     app.kubernetes.io/name: fresh-portal
     app.kubernetes.io/component: backend
     app.kubernetes.io/environment: production
 spec:
   ingressClassName: traefik
+  tls:
+    - hosts:
+        - api-fresh.honglam.net
+      secretName: cloudflare-origin-tls
   rules:
     - host: api-fresh.honglam.net
       http:

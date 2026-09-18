@@ -133,32 +133,70 @@ Các hostname đã được cấu hình như sau:
 | Môi trường | Frontend | Backend | Đường truy cập |
 |---|---|---|---|
 | Staging | `fresh-stg.honglam.net` | `api-fresh-stg.honglam.net` | Cloudflare Tunnel → Traefik |
-| Production | `fresh.honglam.net` | `api-fresh.honglam.net` | DNS public → public IP của production → Traefik |
+| Production | `fresh.honglam.net` | `api-fresh.honglam.net` | Cloudflare proxy → public IP của production → Traefik HTTPS |
 
 ### Staging qua Cloudflare Tunnel
 
-Cloudflare public hostname phải chuyển tiếp cả hai domain tới Traefik của staging cluster. Nếu `cloudflared` chạy trong K3s, origin service có thể dùng HTTP nội bộ:
+Nếu `cloudflared` chạy trực tiếp bằng systemd trên node K3s và Traefik đang nghe port `80` của node, cấu hình hai Published application trên Cloudflare là:
+
+| Public hostname | Service URL |
+|---|---|
+| `fresh-stg.honglam.net` | `http://localhost:80` |
+| `api-fresh-stg.honglam.net` | `http://localhost:80` |
+
+Có thể kiểm tra Traefik trước khi tạo route:
+
+```bash
+curl -I -H 'Host: fresh-stg.honglam.net' http://127.0.0.1:80
+curl -I -H 'Host: api-fresh-stg.honglam.net' http://127.0.0.1:80
+```
+
+Hai hostname cùng vào port `80`; Traefik chọn Service frontend/backend dựa trên HTTP Host header.
+
+Nếu dùng tunnel quản lý bằng file `config.yml`:
 
 ```yaml
 ingress:
   - hostname: fresh-stg.honglam.net
-    service: http://traefik.kube-system.svc.cluster.local:80
+    service: http://localhost:80
   - hostname: api-fresh-stg.honglam.net
-    service: http://traefik.kube-system.svc.cluster.local:80
+    service: http://localhost:80
   - service: http_status:404
 ```
 
-TLS public được kết thúc tại Cloudflare edge; kết nối từ Tunnel tới Traefik nằm trong mạng nội bộ cluster. Nếu `cloudflared` chạy ngoài K3s, thay origin service bằng địa chỉ HTTP mà máy chạy Tunnel có thể truy cập tới Traefik.
+TLS public được kết thúc tại Cloudflare edge; Tunnel từ Cloudflare tới `cloudflared` vẫn được mã hóa, còn kết nối local tới Traefik dùng HTTP.
 
-### Production qua public IP
+`localhost` chỉ đúng khi `cloudflared` chạy trên node hoặc dùng host network. Nếu `cloudflared` chạy thành Pod trong K3s, thay cả hai Service URL bằng:
 
-Tạo bản ghi DNS `A`/`AAAA` cho `fresh.honglam.net` và `api-fresh.honglam.net` trỏ tới public IP của production. Port `80` và `443` phải được chuyển tiếp tới Traefik.
+```text
+http://traefik.kube-system.svc.cluster.local:80
+```
 
-Trước khi public production bằng HTTPS, cấp certificate hợp lệ cho cả hai hostname bằng cert-manager/Let's Encrypt hoặc TLS secret được quản lý ngoài Git. Không đưa private key của certificate vào repository.
+### Production qua Cloudflare proxy và public IP
+
+1. Tạo bản ghi DNS `A`/`AAAA` cho `fresh.honglam.net` và `api-fresh.honglam.net` trỏ tới public IP của production.
+2. Bật Cloudflare Proxy, trạng thái orange cloud, cho cả hai record.
+3. Chuyển tiếp port `443` của public IP tới Traefik production.
+4. Trong Cloudflare, vào `SSL/TLS → Origin Server → Create Certificate` và tạo Origin CA certificate cho `*.honglam.net`.
+5. Lưu certificate và private key ở máy quản trị an toàn dưới tên ví dụ `origin.crt` và `origin.key`. Không commit hai file này.
+6. Tạo TLS Secret trực tiếp trên production cluster:
+
+```bash
+kubectl create namespace fresh-production --dry-run=client -o yaml +  | kubectl apply -f -
+
+kubectl -n fresh-production create secret tls cloudflare-origin-tls +  --cert=origin.crt +  --key=origin.key
+```
+
+Hai production Ingress cùng tham chiếu Secret `cloudflare-origin-tls`. Secret phải nằm trong namespace `fresh-production`; Argo CD không tạo hoặc quản lý private key này.
+
+7. Trong Cloudflare đặt `SSL/TLS encryption mode` thành `Full (strict)` và bật `Always Use HTTPS`.
+
+Cloudflare Origin CA certificate chỉ dành cho hostname luôn bật proxy. Nếu chuyển record sang DNS only, trình duyệt sẽ không tin certificate này; khi đó phải thay bằng certificate công khai như Let's Encrypt.
 
 ## Ghi chú runtime
 
 - React thường nhận API URL tại build time. Hãy cấu hình URL backend trong pipeline/Docker build của `hl_fresh`, hoặc bổ sung cơ chế runtime config phù hợp với image thực tế.
 - Probe đang dùng TCP để không giả định ứng dụng đã có endpoint health. Khi backend có `/health`, nên đổi sang `httpGet` để readiness phản ánh cả dependency quan trọng.
 - Ingress dùng `ingressClassName: traefik`, phù hợp K3s mặc định. Đổi giá trị này nếu cluster dùng ingress controller khác.
-- Staging nhận HTTPS tại Cloudflare edge. Production cần bổ sung `spec.tls` sau khi đã xác định cert-manager issuer hoặc tên TLS secret thực tế.
+- Staging nhận HTTPS tại Cloudflare edge và đi HTTP nội bộ từ `cloudflared` tới Traefik.
+- Production Ingress kết thúc TLS tại Traefik bằng Secret `cloudflare-origin-tls` và yêu cầu Cloudflare `Full (strict)`.
