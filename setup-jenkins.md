@@ -11,9 +11,9 @@ Người vận hành chọn branch staging/main trong Jenkins
                          ▼
                 Jenkins Controller
                     (Server 1)
-                         │ giao job qua SSH
+                         │ Jenkins Remoting/WebSocket nội bộ
                          ▼
-                  build-agent-01
+            build-agent-01 (Server 1)
                          │
         ┌────────────────┼───────────────────┐
         │                │                   │
@@ -52,13 +52,12 @@ Thay toàn bộ giá trị ví dụ dưới đây bằng giá trị thật:
 |---|---|
 | Harbor FQDN | `harbor.example.com` |
 | Server 1 IP | `10.10.0.10` |
-| Build agent IP | `10.10.0.20` |
 | Harbor project | `honglam` |
 | Tên ứng dụng/image | `myapp` |
 | Source repository | `git@github.com:ORG/myapp.git` |
 | GitOps repository | `git@github.com:ORG/myapp-gitops.git` |
 
-Harbor nên sử dụng tên miền có DNS record trỏ về Server 1. Không nên dùng HTTP hoặc cấu hình `insecure-registry` trong production.
+Client phải truy cập Harbor qua tên miền HTTPS public. Riêng kết nối từ `cloudflared` tới Harbor trên cùng Server 1 sẽ dùng HTTP qua loopback; không cấu hình `insecure-registry` trên Jenkins agent hoặc các node K3s.
 
 ---
 
@@ -74,7 +73,7 @@ Kiểm tra:
 nproc
 free -h
 df -h
-sudo ss -lntp | grep -E ':80 |:443 |:8080 |:8081 |:8443 '
+sudo ss -lntp | grep -E ':80 |:443 |:8080 |:8081 '
 ```
 
 Trong hướng dẫn này sử dụng sơ đồ port sau:
@@ -82,13 +81,12 @@ Trong hướng dẫn này sử dụng sơ đồ port sau:
 | Dịch vụ | Port trên Server 1 | Cách truy cập |
 |---|---:|---|
 | Jenkins | `8080` | Nội bộ hoặc qua hostname riêng |
-| Harbor HTTP origin | `8081` | Chỉ dùng khi cần kiểm tra/chuyển hướng nội bộ |
-| Harbor HTTPS origin | `8443` | Cloudflare Tunnel kết nối tới port này |
+| Harbor HTTP origin | `8081` | Cloudflare Tunnel kết nối qua loopback |
 | Harbor public | `443` tại Cloudflare edge | `https://harbor.example.com` |
 
-`cloudflared` tạo kết nối outbound tới Cloudflare nên bản thân tiến trình này thường không bind port `80` hoặc `443` trên Server 1. Nếu hai port đó đang bận, lệnh `ss` ở trên sẽ cho biết tiến trình thực tế đang sử dụng chúng. Dù vậy, dùng `8081/8443` cho Harbor vẫn giúp tách origin khỏi các reverse proxy và dịch vụ khác trên máy.
+`cloudflared` tạo kết nối outbound tới Cloudflare nên bản thân tiến trình này thường không bind port `80` hoặc `443` trên Server 1. Nếu hai port đó đang bận, lệnh `ss` ở trên sẽ cho biết tiến trình thực tế đang sử dụng chúng. Harbor dùng riêng port origin `8081`.
 
-Không mở public inbound `8081` và `8443` trong cloud firewall/security group. Khi `cloudflared` chạy ngay trên Server 1, Tunnel truy cập origin qua loopback. Chỉ cho phép subnet private của Jenkins agent hoặc node K3s truy cập `8443` nếu chủ động cho các máy đó kết nối trực tiếp thay vì đi qua Tunnel.
+Không mở public inbound `8081` trong cloud firewall/security group. Khi `cloudflared` chạy ngay trên Server 1, Tunnel truy cập origin qua loopback. Docker có thể publish port ra mọi interface, vì vậy vẫn cần chặn `8081` bằng firewall hạ tầng hoặc chain `DOCKER-USER`.
 
 Tham khảo: [Harbor installation prerequisites](https://goharbor.io/docs/edge/install-config/installation-prereqs/)
 
@@ -139,42 +137,24 @@ Tham khảo: [Install Docker Engine on Ubuntu](https://docs.docker.com/engine/in
 
 > Docker có thể bypass một số rule UFW khi publish container port. Cần kiểm soát traffic bằng firewall hạ tầng và chain `DOCKER-USER`, không chỉ dựa vào UFW.
 
-## 5. Chuẩn bị TLS cho Harbor
+## 5. Mô hình TLS với Cloudflare Tunnel
 
-Production nên dùng certificate từ CA tin cậy hoặc CA nội bộ của tổ chức. Chuẩn bị:
+Trong mô hình này, Harbor và `cloudflared` cùng nằm trên Server 1:
 
 ```text
-/etc/harbor/tls/harbor.crt
-/etc/harbor/tls/harbor.key
+Client --HTTPS--> Cloudflare --Tunnel--> cloudflared --HTTP localhost:8081--> Harbor
 ```
 
-Tạo thư mục và chép certificate:
+Harbor origin không cần certificate riêng. HTTPS public được kết thúc tại Cloudflare, còn hop từ `cloudflared` tới Harbor chỉ đi qua loopback của Server 1.
 
-```bash
-sudo install -d -m 0750 /etc/harbor/tls
+Điều kiện an toàn:
 
-sudo install -m 0644 /duong-dan/fullchain.pem \
-  /etc/harbor/tls/harbor.crt
+- Không mở port `8081` ra Internet.
+- Jenkins agent và node K3s dùng `https://harbor.example.com`, không dùng `http://SERVER_1_IP:8081`.
+- Không thêm Harbor vào `insecure-registries` của Docker hoặc K3s.
+- Nếu sau này chuyển `cloudflared` sang máy khác, phải dùng HTTPS hoặc mạng private được bảo vệ cho kết nối tới origin.
 
-sudo install -m 0600 /duong-dan/privkey.pem \
-  /etc/harbor/tls/harbor.key
-```
-
-Kiểm tra certificate có đúng hostname:
-
-```bash
-openssl x509 \
-  -in /etc/harbor/tls/harbor.crt \
-  -noout \
-  -subject \
-  -issuer \
-  -dates \
-  -ext subjectAltName
-```
-
-Nếu mọi client truy cập Harbor qua Cloudflare Tunnel, chỉ dịch vụ `cloudflared` trên Server 1 cần tin cậy CA của origin. Chỉ cài CA root lên build agent, Server 2 và Server 3 khi các máy này kết nối trực tiếp tới origin. Không sử dụng `--insecure` trong pipeline.
-
-Tham khảo: [Configure HTTPS access to Harbor](https://goharbor.io/docs/main/install-config/configure-https/)
+Tham khảo: [Cloudflare Tunnel configuration](https://developers.cloudflare.com/tunnel/configuration/)
 
 ## 6. Tải Harbor installer
 
@@ -214,13 +194,8 @@ hostname: harbor.example.com
 http:
   port: 8081
 
-https:
-  port: 8443
-  certificate: /etc/harbor/tls/harbor.crt
-  private_key: /etc/harbor/tls/harbor.key
-
 # URL public mà Docker, Jenkins và trình duyệt sử dụng qua Cloudflare Tunnel.
-# Khi đặt external_url, Harbor dùng giá trị này để tạo URL và token service.
+# Giá trị vẫn là HTTPS dù origin phía trên dùng HTTP.
 external_url: https://harbor.example.com
 
 # Dùng mật khẩu dài, ngẫu nhiên và không commit file này lên Git.
@@ -237,7 +212,7 @@ trivy:
   offline_scan: false
 ```
 
-Chứng chỉ origin tại `/etc/harbor/tls/harbor.crt` phải có SAN `harbor.example.com`. Giữ `external_url` không có `:8443`: client truy cập Cloudflare bằng HTTPS port `443`, còn Cloudflare mới kết nối tới origin port `8443`.
+Giữ `external_url` là `https://harbor.example.com`: đây là URL mà Docker, Jenkins agent và K3s nhìn thấy ở Cloudflare edge. Giá trị này không phải giao thức kết nối local giữa `cloudflared` và Harbor.
 
 Tạo data directory trên ổ đĩa có đủ dung lượng:
 
@@ -259,12 +234,9 @@ cd /opt/harbor
 sudo docker compose ps
 sudo docker compose logs --tail=100
 
-# Kiểm tra trực tiếp origin, không đi qua Cloudflare.
-curl --resolve harbor.example.com:8443:127.0.0.1 \
-  -fsS https://harbor.example.com:8443/api/v2.0/ping
+# Kiểm tra trực tiếp HTTP origin, không đi qua Cloudflare.
+curl -fsS http://127.0.0.1:8081/api/v2.0/ping
 ```
-
-Nếu origin dùng CA nội bộ chưa có trong trust store của Server 1, thêm `--cacert /duong-dan/ca-root.crt` vào lệnh kiểm tra; không dùng `-k`.
 
 Nếu Harbor đã được cài bằng port cũ, sau khi sửa `harbor.yml` hãy tạo lại cấu hình và container, không xóa data volume:
 
@@ -276,17 +248,15 @@ sudo docker compose up -d
 sudo docker compose ps
 ```
 
-### 8.1. Trỏ Cloudflare Tunnel vào Harbor port `8443`
+### 8.1. Trỏ Cloudflare Tunnel vào Harbor port `8081`
 
 Nếu Tunnel được quản lý trong Cloudflare Dashboard, tạo Public Hostname với các giá trị:
 
 | Trường | Giá trị |
 |---|---|
 | Subdomain/hostname | `harbor.example.com` |
-| Service type | `HTTPS` |
-| URL | `localhost:8443` |
-| Origin Server Name | `harbor.example.com` |
-| No TLS Verify | Tắt |
+| Service type | `HTTP` |
+| URL | `localhost:8081` |
 
 Nếu dùng Tunnel được quản lý bằng file local, cập nhật `/etc/cloudflared/config.yml`:
 
@@ -296,16 +266,10 @@ credentials-file: /root/.cloudflared/TUNNEL_UUID.json
 
 ingress:
   - hostname: harbor.example.com
-    service: https://127.0.0.1:8443
-    originRequest:
-      originServerName: harbor.example.com
-      # Bỏ comment nếu chứng chỉ Harbor do CA nội bộ ký.
-      # caPool: /etc/cloudflared/harbor-ca.crt
+    service: http://127.0.0.1:8081
 
   - service: http_status:404
 ```
-
-Không bật `noTLSVerify: true` lâu dài. Nếu dùng CA nội bộ, chép CA root tới Server 1, đặt quyền đọc cho dịch vụ `cloudflared`, rồi khai báo `caPool` như ví dụ.
 
 Kiểm tra và restart Tunnel:
 
@@ -331,9 +295,9 @@ Docker cũng sử dụng hostname public:
 docker login harbor.example.com
 ```
 
-> **Lưu ý khi push image qua Cloudflare:** lưu lượng Registry đi qua HTTP proxy của Cloudflare chịu giới hạn kích thước request theo gói (ví dụ Free/Pro là 100 MB và Business là 200 MB tại thời điểm viết tài liệu) và có thể gặp timeout với layer lớn. Nếu Jenkins báo `413` hoặc `524`, ưu tiên cho build agent và các node K3s truy cập Harbor qua mạng private/VPN hoặc Cloudflare private network; không mở `8443` ra toàn Internet và không chuyển Docker sang `insecure-registry`.
+> **Lưu ý khi push image qua Cloudflare:** lưu lượng Registry đi qua HTTP proxy của Cloudflare chịu giới hạn kích thước request theo gói (ví dụ Free/Pro là 100 MB và Business là 200 MB tại thời điểm viết tài liệu) và có thể gặp timeout với layer lớn. Nếu Jenkins báo `413` hoặc `524`, nên thiết kế đường truy cập private có TLS cho build agent và các node K3s; không mở HTTP port `8081` ra Internet và không chuyển Docker sang `insecure-registry`.
 
-Tham khảo: [Run the Harbor installer](https://goharbor.io/docs/edge/install-config/run-installer-script/), [Harbor `external_url`](https://goharbor.io/docs/edge/install-config/configure-yml-file/), [Cloudflare Tunnel HTTPS origin](https://developers.cloudflare.com/tunnel/troubleshooting/https-origins/), [Cloudflare Tunnel configuration file](https://developers.cloudflare.com/tunnel/features/locally-managed-tunnels/configuration-file/), [Cloudflare upload limits](https://developers.cloudflare.com/support/troubleshooting/http-status-codes/4xx-client-error/error-413/)
+Tham khảo: [Run the Harbor installer](https://goharbor.io/docs/edge/install-config/run-installer-script/), [Harbor `external_url`](https://goharbor.io/docs/edge/install-config/configure-yml-file/), [Cloudflare Tunnel configuration file](https://developers.cloudflare.com/tunnel/features/locally-managed-tunnels/configuration-file/), [Cloudflare upload limits](https://developers.cloudflare.com/support/troubleshooting/http-status-codes/4xx-client-error/error-413/)
 
 ## 9. Tạo project và policy trong Harbor
 
@@ -406,25 +370,35 @@ Không lưu bản backup duy nhất trên Server 1.
 
 ## 12. Vị trí đặt agent
 
-Phương án production khuyến nghị:
+Mô hình áp dụng trong tài liệu này:
 
 ```text
-Server 1: Jenkins controller + Harbor
-VM/Server riêng: build-agent-01
+Server 1
+├── Jenkins controller — user jenkins
+├── Jenkins local agent — user jenkins-agent
+├── Docker Engine
+└── Harbor
 ```
 
-Nếu chưa có server thứ tư, có thể tạo một VM riêng trên hạ tầng hiện có. Chỉ trong môi trường thử nghiệm mới đặt agent trực tiếp trên Server 1.
+Agent vẫn là một Jenkins node riêng, có executor, label và workspace riêng, nhưng tiến trình agent chạy ngay trên Server 1. Agent chủ động kết nối tới controller qua WebSocket nội bộ `http://127.0.0.1:8080`; không cần SSH hoặc địa chỉ IP riêng cho node.
 
-Lý do: user nằm trong group `docker` gần như có quyền root trên agent. Nếu agent cùng host với controller, một Jenkinsfile độc hại có thể ảnh hưởng Jenkins, Harbor và những dịch vụ khác trên Server 1.
+Đặt số executor của built-in node về `0` để job không chạy bằng user dịch vụ `jenkins`:
 
-Các bước bên dưới chạy trên một Ubuntu VM riêng có hostname `build-agent-01`.
+```text
+Manage Jenkins
+→ Nodes
+→ Built-In Node
+→ Configure
+→ Number of executors: 0
+```
+
+> **Rủi ro chấp nhận trong mô hình này:** `jenkins-agent` thuộc group `docker`, nên gần như có quyền root trên Server 1. Việc tách user và workspace giúp tách vận hành nhưng không tạo cách ly bảo mật với Jenkins controller, Harbor, Vault hoặc các dịch vụ khác. Production có yêu cầu bảo mật cao vẫn nên chuyển agent sang VM riêng.
 
 ## 13. Tạo user và cài công cụ nền
 
-Trên build agent:
+Thực hiện trên Server 1:
 
 ```bash
-sudo hostnamectl set-hostname build-agent-01
 sudo apt update
 sudo apt install -y \
   openjdk-21-jre \
@@ -435,14 +409,20 @@ sudo apt install -y \
   wget \
   gnupg \
   ca-certificates \
-  openssh-server
+  openssh-client
 
-sudo adduser \
-  --disabled-password \
-  --gecos '' \
-  jenkins-agent
+if ! id jenkins-agent >/dev/null 2>&1; then
+  sudo adduser \
+    --disabled-password \
+    --gecos '' \
+    jenkins-agent
+fi
 
-sudo systemctl enable --now ssh
+sudo install -d \
+  -m 0750 \
+  -o jenkins-agent \
+  -g jenkins-agent \
+  /home/jenkins-agent
 ```
 
 Kiểm tra:
@@ -452,21 +432,21 @@ java -version
 git --version
 ```
 
-## 14. Cài Docker trên build agent
+## 14. Cấp quyền Docker cho local agent
 
-Thực hiện lại bước cài Docker Engine ở phần Harbor trên build agent, sau đó:
+Docker Engine đã được cài trên Server 1 ở phần Harbor. Không cài thêm Docker daemon và không cần restart Docker. Chỉ thêm local agent vào group `docker`:
 
 ```bash
 sudo usermod -aG docker jenkins-agent
-sudo systemctl restart docker
-sudo -u jenkins-agent -H docker version
+id jenkins-agent
+sudo -iu jenkins-agent docker version
 ```
 
-Nếu lệnh cuối báo permission denied, đăng xuất/đăng nhập lại hoặc reboot agent rồi thử lại.
+Nếu systemd agent đang chạy từ trước, restart `jenkins-agent.service` sau khi thêm group để tiến trình nhận supplementary group mới.
 
-> Thành viên group `docker` có quyền kiểm soát Docker daemon và gần tương đương root. Chỉ dùng trên agent chuyên dụng, không cấp cho user trên Jenkins controller.
+> Không thêm user `jenkins` của controller vào group `docker`. Chỉ user `jenkins-agent` được phép chạy Docker.
 
-## 15. Cài Trivy trên build agent
+## 15. Cài Trivy cho local agent
 
 ```bash
 wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key \
@@ -483,7 +463,7 @@ trivy --version
 
 Tham khảo: [Install Trivy](https://www.trivy.dev/docs/latest/getting-started/installation/)
 
-## 16. Cài Cosign trên build agent
+## 16. Cài Cosign cho local agent
 
 Pin phiên bản đã kiểm thử thay vì tự động lấy `latest` trong mỗi build:
 
@@ -501,7 +481,7 @@ Nếu agent dùng ARM64, thay asset `amd64` bằng `arm64` phù hợp với rele
 
 Tham khảo: [Install Cosign](https://docs.sigstore.dev/cosign/system_config/installation/)
 
-## 17. Cài Kustomize trên build agent
+## 17. Cài Kustomize cho local agent
 
 Pipeline dùng Kustomize để thay image digest trong GitOps repository:
 
@@ -516,116 +496,24 @@ sudo install -m 0755 /tmp/kustomize /usr/local/bin/kustomize
 kustomize version
 ```
 
-## 18. Cho build agent tin cậy Harbor TLS
+## 18. Kiểm tra build agent kết nối Harbor
 
-Nếu build agent truy cập `https://harbor.example.com` qua Cloudflare Tunnel, agent nhận chứng chỉ public ở Cloudflare edge nên thường không cần cài CA của origin. CA origin chỉ cần được `cloudflared` trên Server 1 tin cậy.
-
-Chỉ thực hiện phần dưới đây nếu build agent kết nối trực tiếp tới Harbor origin bằng hostname private và port `8443`. Chép CA root lên agent rồi chạy:
+Local agent có thể nhìn thấy Harbor origin tại `127.0.0.1:8081`, nhưng pipeline vẫn phải sử dụng hostname chuẩn `harbor.example.com`. Nhờ vậy image reference được ghi vào GitOps repository cũng là địa chỉ mà Server 2 và Server 3 có thể pull:
 
 ```bash
-sudo install -m 0644 harbor-ca.crt \
-  /usr/local/share/ca-certificates/harbor-ca.crt
-
-sudo update-ca-certificates
-
-sudo install -d -m 0755 \
-  /etc/docker/certs.d/harbor.internal.example.com:8443
-
-sudo install -m 0644 harbor-ca.crt \
-  /etc/docker/certs.d/harbor.internal.example.com:8443/ca.crt
-
-sudo systemctl restart docker
-curl -fsS https://harbor.internal.example.com:8443/api/v2.0/ping
+curl -fsS https://harbor.example.com/api/v2.0/ping
+docker login harbor.example.com
 ```
 
-Khi dùng endpoint private, chứng chỉ phải có SAN `harbor.internal.example.com`; đồng thời biến `HARBOR_HOST` của pipeline phải là `harbor.internal.example.com:8443`. Nếu dùng endpoint public qua Tunnel như pipeline mẫu trong tài liệu, tiếp tục giữ `HARBOR_HOST=harbor.example.com`.
-
-## 19. Tạo SSH key cho controller kết nối agent
-
-Trên Server 1:
-
-```bash
-sudo -u jenkins install -d \
-  -m 0700 \
-  /var/lib/jenkins/.ssh
-
-sudo -u jenkins ssh-keygen \
-  -t ed25519 \
-  -f /var/lib/jenkins/.ssh/build-agent-01 \
-  -C 'jenkins-controller-to-build-agent-01' \
-  -N ''
-
-sudo cat /var/lib/jenkins/.ssh/build-agent-01.pub
-```
-
-Chép đúng public key vừa in sang build agent:
-
-```bash
-sudo install -d \
-  -m 0700 \
-  -o jenkins-agent \
-  -g jenkins-agent \
-  /home/jenkins-agent/.ssh
-
-echo 'DAN_PUBLIC_KEY_VAO_DAY' \
-  | sudo tee /home/jenkins-agent/.ssh/authorized_keys >/dev/null
-
-sudo chown jenkins-agent:jenkins-agent \
-  /home/jenkins-agent/.ssh/authorized_keys
-
-sudo chmod 0600 \
-  /home/jenkins-agent/.ssh/authorized_keys
-```
-
-Lấy SSH host public key của agent:
-
-```bash
-sudo cat /etc/ssh/ssh_host_ed25519_key.pub
-sudo ssh-keygen \
-  -lf /etc/ssh/ssh_host_ed25519_key.pub
-```
-
-Đưa host key đã xác minh vào `/var/lib/jenkins/.ssh/known_hosts` trên controller. Không chọn chiến lược `Non verifying Verification Strategy` trong Jenkins.
-
-Kiểm tra từ Server 1:
-
-```bash
-sudo -u jenkins ssh \
-  -i /var/lib/jenkins/.ssh/build-agent-01 \
-  jenkins-agent@BUILD_AGENT_IP \
-  'java -version && docker version && trivy --version && cosign version && kustomize version'
-```
-
-## 20. Khai báo SSH credential của agent trong Jenkins
-
-Vào:
+Agent nhận chứng chỉ HTTPS public ở Cloudflare edge nên không cần cài CA của Harbor origin. Giữ biến pipeline:
 
 ```text
-Manage Jenkins
-→ Credentials
-→ System
-→ Global credentials
-→ Add Credentials
+HARBOR_HOST=harbor.example.com
 ```
 
-Cấu hình:
+Không dùng `localhost:8081` làm tên image trong pipeline: image mang tên đó sẽ không thể được K3s trên Server 2 hoặc Server 3 pull. HTTP port `8081` chỉ dành cho `cloudflared` và kiểm tra origin cục bộ.
 
-```text
-Kind: SSH Username with private key
-ID: build-agent-01-ssh
-Username: jenkins-agent
-Private Key: Enter directly
-```
-
-Lấy private key để dán từ Server 1:
-
-```bash
-sudo cat /var/lib/jenkins/.ssh/build-agent-01
-```
-
-Không gửi private key qua email/chat và không commit vào Git.
-
-## 21. Khai báo node trong Jenkins
+## 19. Khai báo local node trong Jenkins
 
 Vào:
 
@@ -644,19 +532,142 @@ Number of executors: 1
 Remote root directory: /home/jenkins-agent
 Labels: linux docker trivy cosign kustomize
 Usage: Only build jobs with label expressions matching this node
-Launch method: Launch agents via SSH
-Host: BUILD_AGENT_IP
-Credentials: build-agent-01-ssh
-Host Key Verification Strategy: Known hosts file Verification Strategy
+Launch method: Launch agent by connecting it to the controller
 ```
 
-Lưu và kiểm tra log node. Trạng thái mong muốn:
+Lưu node. Jenkins sẽ hiển thị lệnh kết nối có các giá trị:
+
+```text
+Jenkins URL: http://127.0.0.1:8080/
+Agent name: build-agent-01
+Secret: chuỗi bí mật dành riêng cho node
+```
+
+Không chạy trực tiếp lệnh chứa secret trong shell vì secret sẽ xuất hiện trong shell history. Bước tiếp theo lưu secret vào file chỉ local agent được đọc.
+
+## 20. Cài Jenkins Remoting và lưu agent secret
+
+Tải đúng phiên bản `agent.jar` do controller hiện tại cung cấp:
+
+```bash
+sudo install -d \
+  -m 0755 \
+  /opt/jenkins-agent
+
+sudo curl -fsSL \
+  http://127.0.0.1:8080/jnlpJars/agent.jar \
+  -o /opt/jenkins-agent/agent.jar
+
+sudo chown root:root \
+  /opt/jenkins-agent/agent.jar
+
+sudo chmod 0644 \
+  /opt/jenkins-agent/agent.jar
+```
+
+Tạo file secret:
+
+```bash
+sudo install -d \
+  -m 0750 \
+  -o root \
+  -g jenkins-agent \
+  /etc/jenkins-agent
+
+sudo touch /etc/jenkins-agent/secret
+sudo chown root:jenkins-agent \
+  /etc/jenkins-agent/secret
+sudo chmod 0640 \
+  /etc/jenkins-agent/secret
+
+sudo nano /etc/jenkins-agent/secret
+```
+
+Dán duy nhất chuỗi `Secret` lấy từ trang node vào file rồi lưu. Không thêm secret vào tài liệu, Git hoặc Jenkinsfile.
+
+Kiểm tra file JAR và các công cụ dưới đúng user agent:
+
+```bash
+sudo -iu jenkins-agent java \
+  -jar /opt/jenkins-agent/agent.jar \
+  -version
+
+sudo -iu jenkins-agent bash -lc \
+  'docker version && trivy --version && cosign version && kustomize version'
+```
+
+## 21. Chạy local agent bằng systemd
+
+Tạo `/etc/systemd/system/jenkins-agent.service`:
+
+```ini
+[Unit]
+Description=Jenkins local build agent
+After=jenkins.service docker.service network-online.target
+Wants=jenkins.service docker.service network-online.target
+
+[Service]
+Type=simple
+User=jenkins-agent
+Group=jenkins-agent
+SupplementaryGroups=docker
+WorkingDirectory=/home/jenkins-agent
+ExecStart=/usr/bin/java -jar /opt/jenkins-agent/agent.jar \
+  -url http://127.0.0.1:8080/ \
+  -secret @/etc/jenkins-agent/secret \
+  -name build-agent-01 \
+  -webSocket \
+  -workDir /home/jenkins-agent
+Restart=always
+RestartSec=10
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Nạp và khởi động service:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now jenkins-agent
+sudo systemctl status jenkins-agent --no-pager
+```
+
+Theo dõi log nếu agent chưa online:
+
+```bash
+sudo journalctl \
+  -u jenkins-agent \
+  -n 100 \
+  --no-pager
+```
+
+Trở lại:
+
+```text
+Manage Jenkins
+→ Nodes
+→ build-agent-01
+```
+
+Trạng thái mong muốn:
 
 ```text
 Agent successfully connected and online
 ```
 
-Tham khảo: [Using Jenkins agents](https://www.jenkins.io/doc/book/using/using-agents/)
+WebSocket dùng cùng HTTP port `8080` trên loopback nên không cần mở inbound agent TCP port và không cần SSH credential cho node. Khi nâng cấp Jenkins, tải lại `agent.jar` từ controller rồi restart service:
+
+```bash
+sudo curl -fsSL \
+  http://127.0.0.1:8080/jnlpJars/agent.jar \
+  -o /opt/jenkins-agent/agent.jar
+
+sudo systemctl restart jenkins-agent
+```
+
+Tham khảo: [Using Jenkins agents](https://www.jenkins.io/doc/book/using/using-agents/), [Jenkins Remoting inbound agent](https://github.com/jenkinsci/remoting/blob/master/docs/inbound-agent.md)
 
 ---
 
@@ -1241,7 +1252,8 @@ Sau khi staging hoạt động ổn định mới chạy `main` và thử bướ
 - Bật HTTPS và không sử dụng `insecure-registry`.
 - Rotate Harbor robot secret định kỳ.
 - Giới hạn agent còn một executor trong giai đoạn đầu.
-- Đặt CPU, RAM và disk quota cho agent VM.
+- Theo dõi CPU, RAM và disk dùng chung trên Server 1; giới hạn tài nguyên của build/container để CI không làm gián đoạn Harbor và Jenkins.
+- Lập kế hoạch chuyển local agent sang VM riêng khi workload hoặc yêu cầu bảo mật tăng.
 - Bật tag immutability và retention trong Harbor.
 - Bật scan-on-push để Harbor kiểm tra lại image sau CI scan.
 - Bật Cosign content trust sau khi đã verify end-to-end.
