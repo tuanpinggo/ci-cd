@@ -54,8 +54,8 @@ Thay toàn bộ giá trị ví dụ dưới đây bằng giá trị thật:
 | Server 1 IP | `10.10.0.10` |
 | Harbor project | `honglam` |
 | Tên ứng dụng/image | `myapp` |
-| Source repository | `git@github.com:ORG/myapp.git` |
-| GitOps repository | `git@github.com:ORG/myapp-gitops.git` |
+| Source repository | `https://github.com/ORG/myapp.git` |
+| GitOps repository | `https://github.com/ORG/myapp-gitops.git` |
 
 Client phải truy cập Harbor qua tên miền HTTPS public. Riêng kết nối từ `cloudflared` tới Harbor trên cùng Server 1 sẽ dùng HTTP qua loopback; không cấu hình `insecure-registry` trên Jenkins agent hoặc các node K3s.
 
@@ -408,8 +408,7 @@ sudo apt install -y \
   curl \
   wget \
   gnupg \
-  ca-certificates \
-  openssh-client
+  ca-certificates
 
 if ! id jenkins-agent >/dev/null 2>&1; then
   sudo adduser \
@@ -675,18 +674,132 @@ Tham khảo: [Using Jenkins agents](https://www.jenkins.io/doc/book/using/using-
 
 ## 22. Danh sách credential
 
-Vào `Manage Jenkins → Credentials`, tạo các credential sau:
+Pipeline trong tài liệu dùng GitHub Personal Access Token qua HTTPS, không dùng SSH deploy key. Kiểm tra Jenkins đã có các plugin:
+
+```text
+Manage Jenkins
+→ Plugins
+→ Installed plugins
+→ Git
+→ Credentials Binding
+```
+
+Tất cả credential bên dưới được tạo tại:
+
+```text
+Manage Jenkins
+→ Credentials
+→ System
+→ Global credentials (unrestricted)
+→ Add Credentials
+```
+
+`ID` là giá trị Jenkinsfile tham chiếu và phân biệt chữ hoa/chữ thường. Phải nhập đúng ID trong bảng, không để Jenkins tự sinh ID:
 
 | Credential ID | Loại | Quyền |
 |---|---|---|
-| `github-source-read` | SSH private key | Chỉ đọc source repository |
-| `github-gitops-write` | SSH private key | Chỉ ghi GitOps repository |
+| `github-source-read` | Username with password | GitHub token chỉ đọc source repository |
+| `github-gitops-write` | Username with password | GitHub token đọc/ghi GitOps repository |
 | `harbor-robot-ci` | Username with password | Project robot, chỉ pull/push project `honglam` |
 | `cosign-private-key` | Secret file | Cosign private key |
 | `cosign-public-key` | Secret file | Cosign public key |
 | `cosign-key-password` | Secret text | Mật khẩu mã hóa Cosign private key |
 
-Không dùng cùng một GitHub key cho source repository và GitOps repository. Với GitHub, ưu tiên GitHub App; nếu dùng deploy key, source key chỉ read và GitOps key mới có write.
+### 22.1. Kiểm tra quyền GitHub token
+
+Khuyến nghị dùng hai fine-grained token riêng:
+
+| Token | Repository access | Repository permissions |
+|---|---|---|
+| Source token | Chỉ chọn source repository | `Contents: Read-only` |
+| GitOps token | Chỉ chọn GitOps repository | `Contents: Read and write` |
+
+`Metadata: Read-only` được GitHub cấp kèm theo. Nếu repository thuộc organization, token có thể ở trạng thái `Pending` cho tới khi org owner phê duyệt; organization dùng SSO cũng có thể yêu cầu authorize token.
+
+Nếu hiện tại chỉ có một token, có thể tạm tạo cả hai Jenkins credential bằng cùng token, với điều kiện token truy cập được cả hai repository và có quyền ghi GitOps repository. Cách này hoạt động nhưng quyền rộng hơn cần thiết; nên tách token sau khi pipeline chạy ổn định.
+
+Tài khoản sở hữu token phải có quyền đọc source repository và quyền `Write` trên GitOps repository. Nếu branch `main` của GitOps repository chặn direct push, stage cập nhật GitOps sẽ thất bại; khi đó cần chuyển quy trình sang tạo pull request.
+
+### 22.2. Tạo `github-source-read`
+
+Tại màn hình `Add Credentials`, nhập:
+
+```text
+Kind: Username with password
+Scope: Global
+Username: TEN_DANG_NHAP_GITHUB
+Password: Dán GitHub Personal Access Token
+ID: github-source-read
+Description: GitHub source repository - read only
+```
+
+`Username` là GitHub login, không phải email. Token được dán vào ô `Password`; không chọn loại `SSH Username with private key`. Nhấn `Create`.
+
+### 22.3. Tạo `github-gitops-write`
+
+Chọn `Add Credentials` lần nữa và nhập:
+
+```text
+Kind: Username with password
+Scope: Global
+Username: TEN_DANG_NHAP_GITHUB
+Password: Dán GitHub Personal Access Token có Contents: Read and write
+ID: github-gitops-write
+Description: GitHub GitOps repository - read and write
+```
+
+Nhấn `Create`. Không đưa token vào URL repository, Jenkinsfile, shell command, description hoặc Git.
+
+### 22.4. Tạo `harbor-robot-ci`
+
+Mở project `honglam` trong Harbor, vào `Robot Accounts` và lấy username/secret của robot account đã tạo ở phần trước. Trong Jenkins chọn `Add Credentials`:
+
+```text
+Kind: Username with password
+Scope: Global
+Username: Username robot chính xác Harbor hiển thị
+Password: Secret của robot account
+ID: harbor-robot-ci
+Description: Harbor project honglam - CI push and pull
+```
+
+Không tự sửa prefix username robot. Harbor chỉ hiển thị secret một lần; nếu đã mất secret thì tạo hoặc refresh robot secret rồi cập nhật Jenkins credential.
+
+### 22.5. Tạo ba Cosign credential
+
+Sau khi tạo `cosign.key` và `cosign.pub` theo mục 23, thêm từng credential.
+
+Private key:
+
+```text
+Kind: Secret file
+Scope: Global
+File: Chọn file cosign.key
+ID: cosign-private-key
+Description: Cosign encrypted private key
+```
+
+Public key:
+
+```text
+Kind: Secret file
+Scope: Global
+File: Chọn file cosign.pub
+ID: cosign-public-key
+Description: Cosign public key
+```
+
+Mật khẩu mã hóa private key:
+
+```text
+Kind: Secret text
+Scope: Global
+Secret: Mật khẩu đã nhập khi chạy cosign generate-key-pair
+ID: cosign-key-password
+Description: Cosign private key password
+```
+
+Sau khi hoàn tất, trang `Global credentials` phải hiển thị đủ sáu ID trong bảng. Jenkins che nội dung secret; không kiểm tra bằng cách in credential ra console.
 
 ## 23. Tạo Cosign key pair
 
@@ -708,24 +821,36 @@ cosign.pub
 
 Tham khảo: [Cosign container signing](https://docs.sigstore.dev/cosign/signing/signing_with_containers/)
 
-## 24. Cấu hình GitHub known host trên agent
+## 24. Cấu hình Git tool cho HTTPS credential
 
-Đưa GitHub Ed25519 host key chính thức vào agent:
+Vì GitHub dùng HTTPS + token nên không cần thêm GitHub SSH host key vào `known_hosts`.
+
+Kiểm tra Git trên local agent:
 
 ```bash
-sudo -u jenkins-agent install -d \
-  -m 0700 \
-  /home/jenkins-agent/.ssh
-
-echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' \
-  | sudo -u jenkins-agent tee -a \
-  /home/jenkins-agent/.ssh/known_hosts >/dev/null
-
-sudo chmod 0600 \
-  /home/jenkins-agent/.ssh/known_hosts
+sudo -iu jenkins-agent git --version
 ```
 
-Đối chiếu fingerprint hiện tại trong tài liệu GitHub trước khi thực hiện: [GitHub SSH fingerprints](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints).
+Trong Jenkins vào:
+
+```text
+Manage Jenkins
+→ Tools
+→ Git installations
+```
+
+Đảm bảo có Git installation:
+
+```text
+Name: Default
+Path to Git executable: git
+```
+
+Nếu Jenkins của bạn đặt tên Git installation khác `Default`, thay giá trị `gitToolName: 'Default'` trong Jenkinsfile bằng đúng tên đó.
+
+Nếu pipeline báo `No such DSL method 'gitUsernamePassword'`, cập nhật plugin `Git` và `Credentials Binding`, sau đó restart Jenkins an toàn.
+
+Tham khảo: [Jenkins Git step](https://www.jenkins.io/doc/pipeline/steps/git/), [Git username/password credentials binding](https://www.jenkins.io/doc/pipeline/steps/credentials-binding/), [GitHub personal access tokens](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens)
 
 ---
 
@@ -866,8 +991,8 @@ pipeline {
     }
 
     environment {
-        SOURCE_REPO   = 'git@github.com:ORG/myapp.git'
-        GITOPS_REPO   = 'git@github.com:ORG/myapp-gitops.git'
+        SOURCE_REPO   = 'https://github.com/ORG/myapp.git'
+        GITOPS_REPO   = 'https://github.com/ORG/myapp-gitops.git'
         HARBOR_HOST   = 'harbor.example.com'
         HARBOR_PROJECT = 'honglam'
         IMAGE_NAME    = 'myapp'
@@ -1097,7 +1222,12 @@ pipeline {
                 dir('gitops') {
                     deleteDir()
 
-                    sshagent(credentials: ['github-gitops-write']) {
+                    withCredentials([
+                        gitUsernamePassword(
+                            credentialsId: 'github-gitops-write',
+                            gitToolName: 'Default'
+                        )
+                    ]) {
                         sh '''
                             set -euo pipefail
 
@@ -1199,7 +1329,7 @@ Trong cấu hình job:
 Pipeline
 Definition: Pipeline script from SCM
 SCM: Git
-Repository URL: git@github.com:ORG/myapp.git
+Repository URL: https://github.com/ORG/myapp.git
 Credentials: github-source-read
 Branch Specifier: */main
 Script Path: Jenkinsfile
