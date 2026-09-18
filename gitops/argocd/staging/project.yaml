@@ -1,0 +1,14 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: fresh-staging
+spec:
+  description: Fresh Platform staging applications
+  sourceRepos:
+    - https://github.com/honglam-cds-v3/fresh-gitops.git
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: fresh-staging
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"

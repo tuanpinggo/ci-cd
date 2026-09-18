@@ -1,0 +1,21 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: hl-fresh
+  labels:
+    app.kubernetes.io/name: hl-fresh
+    app.kubernetes.io/component: frontend
+    app.kubernetes.io/environment: staging
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: fresh-stg.honglam.net
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: hl-fresh
+                port:
+                  name: http

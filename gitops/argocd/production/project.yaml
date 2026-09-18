@@ -1,0 +1,14 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: fresh-production
+spec:
+  description: Fresh Platform production applications
+  sourceRepos:
+    - https://github.com/honglam-cds-v3/fresh-gitops.git
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: fresh-production
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"

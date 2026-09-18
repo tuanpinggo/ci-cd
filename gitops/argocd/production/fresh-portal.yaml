@@ -1,0 +1,29 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: fresh-portal-production
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: fresh-production
+  source:
+    repoURL: https://github.com/honglam-cds-v3/fresh-gitops.git
+    targetRevision: main
+    path: apps/fresh-portal/overlays/production
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: fresh-production
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - PruneLast=true
+      - ApplyOutOfSyncOnly=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
